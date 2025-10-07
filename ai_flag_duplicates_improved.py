@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import sys
 from dotenv import load_dotenv
+import csv
 
 # Load environment variables from .env file
 load_dotenv()
@@ -62,6 +63,7 @@ class Config:
     dry_run: bool = False
     rate_limit_delay: float = 0.1  # Delay between API calls in seconds
     batch_size: int = 100  # For ChromaDB operations
+    output_file: Path = None  # File to write actions instead of Linear API
     
     @classmethod
     def from_env(cls, issues_json_path: str = None, dry_run: bool = False) -> 'Config':
@@ -76,10 +78,9 @@ class Config:
                 "- LINEAR_OAUTH_ACCESS_TOKEN or LINEAR_API_KEY"
             )
         
-        # Use cross-platform paths
-        home = Path.home()
-        default_db_path = home / ".chroma" / "bug-bounty"
-        default_issues_path = home / "linear_issues.json"
+        # Use cross-platform paths - save in current working directory
+        default_db_path = Path.cwd() / ".chroma" / "bug-bounty"
+        default_issues_path = Path.cwd() / "linear_issues.json"
         
         return cls(
             openai_api_key=openai_key,
@@ -89,7 +90,8 @@ class Config:
             issues_json_path=Path(issues_json_path) if issues_json_path else default_issues_path,
             dry_run=dry_run,
             confidence_threshold=int(os.environ.get('CONFIDENCE_THRESHOLD', '65')),
-            max_candidates=int(os.environ.get('MAX_CANDIDATES', '10'))
+            max_candidates=int(os.environ.get('MAX_CANDIDATES', '10')),
+            output_file=Path.cwd() / "linear_actions_output.csv"
         )
 
 class LinearAPI:
@@ -103,6 +105,80 @@ class LinearAPI:
             "Content-Type": "application/json"
         }
         self._request_count = 0
+        self._actions_log = []  # Store actions to write to file
+
+    def write_actions_to_file(self):
+        """Write all logged actions to a CSV file."""
+        if not self._actions_log:
+            logger.info("No actions to write to file")
+            return
+        
+        # Ensure output directory exists
+        self.config.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(self.config.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['issue_identifier', 'matches_summary']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for action in self._actions_log:
+                writer.writerow(action)
+        
+        logger.info(f"Wrote {len(self._actions_log)} actions to {self.config.output_file}")
+
+    def write_single_action_to_file(self, action: Dict[str, Any]):
+        """Write a single action to the CSV file immediately."""
+        # Ensure output directory exists
+        self.config.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Check if file exists to determine if we need to write header
+        file_exists = self.config.output_file.exists()
+        
+        with open(self.config.output_file, 'a', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['issue_identifier', 'matches_summary']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Write header only if file is new
+            if not file_exists:
+                writer.writeheader()
+            
+            writer.writerow(action)
+        
+        logger.debug(f"Wrote action to file for {action['issue_identifier']}")
+
+    def initialize_output_file(self):
+        """Initialize the output file by clearing it and writing the header."""
+        # Ensure output directory exists
+        self.config.output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Clear the file and write header
+        with open(self.config.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['issue_identifier', 'matches_summary']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+        
+        logger.info(f"Initialized output file: {self.config.output_file}")
+
+    def write_duplicate_summary(self, issue_identifier: str, duplicates: List[Dict[str, Any]]):
+        """Write a summary of duplicate matches for an issue."""
+        if not duplicates:
+            matches_summary = "0 - No duplicates found"
+        else:
+            # Format: "[total matches] - ([issue identifier 1]: [confidence], [issue identifier 2]: [confidence], ...)"
+            match_details = []
+            for dup in duplicates:
+                match_details.append(f"{dup['id']}: {dup['confidence']}")
+            
+            matches_summary = f"{len(duplicates)} - ({', '.join(match_details)})"
+        
+        action = {
+            'issue_identifier': issue_identifier,
+            'matches_summary': matches_summary
+        }
+        
+        self._actions_log.append(action)
+        self.write_single_action_to_file(action)
+        logger.info(f"Wrote duplicate summary for {issue_identifier}: {matches_summary}")
 
     def _make_request(self, query: str) -> Dict[str, Any]:
         """Helper to make requests to the Linear API with rate limiting."""
@@ -136,150 +212,168 @@ class LinearAPI:
 
     def get_or_create_label_id(self, label_name: str) -> Optional[str]:
         """Gets the ID of a label by name, creating it if it doesn't exist."""
-        if self.config.dry_run:
-            logger.info(f"[DRY RUN] Would get/create label: {label_name}")
-            return "dry-run-label-id"
+        # COMMENTED OUT: Original Linear API call
+        # if self.config.dry_run:
+        #     logger.info(f"[DRY RUN] Would get/create label: {label_name}")
+        #     return "dry-run-label-id"
         
-        # First, try to get existing label
-        query = f'''
-        query {{
-            team(id: "{self.config.linear_team_id}") {{
-                labels {{
-                    nodes {{
-                        id
-                        name
-                    }}
-                }}
-            }}
-        }}
-        '''
+        # # First, try to get existing label
+        # query = f'''
+        # query {{
+        #     team(id: "{self.config.linear_team_id}") {{
+        #         labels {{
+        #             nodes {{
+        #                 id
+        #                 name
+        #             }}
+        #         }}
+        #     }}
+        # }}
+        # '''
         
-        data = self._make_request(query)
-        if data and 'data' in data and 'team' in data['data'] and data['data']['team']:
-            for label in data['data']['team']['labels']['nodes']:
-                if label['name'] == label_name:
-                    logger.debug(f"Found existing label: {label_name} (ID: {label['id']})")
-                    return label['id']
+        # data = self._make_request(query)
+        # if data and 'data' in data and 'team' in data['data'] and data['data']['team']:
+        #     for label in data['data']['team']['labels']['nodes']:
+        #         if label['name'] == label_name:
+        #             logger.debug(f"Found existing label: {label_name} (ID: {label['id']})")
+        #             return label['id']
 
-        # If not found, create it
-        logger.info(f"Creating new label: {label_name}")
-        mutation = f'''
-        mutation {{
-            labelCreate(input: {{
-                name: "{label_name}",
-                teamId: "{self.config.linear_team_id}"
-            }}) {{
-                label {{
-                    id
-                }}
-                success
-            }}
-        }}
-        '''
+        # # If not found, create it
+        # logger.info(f"Creating new label: {label_name}")
+        # mutation = f'''
+        # mutation {{
+        #     labelCreate(input: {{
+        #         name: "{label_name}",
+        #         teamId: "{self.config.linear_team_id}"
+        #     }}) {{
+        #         label {{
+        #             id
+        #         }}
+        #         success
+        #     }}
+        # }}
+        # '''
         
-        data = self._make_request(mutation)
-        if data and 'data' in data and 'labelCreate' in data['data'] and data['data']['labelCreate']['success']:
-            label_id = data['data']['labelCreate']['label']['id']
-            logger.info(f"Successfully created label: {label_name} (ID: {label_id})")
-            return label_id
+        # data = self._make_request(mutation)
+        # if data and 'data' in data and 'labelCreate' in data['data'] and data['data']['labelCreate']['success']:
+        #     label_id = data['data']['labelCreate']['label']['id']
+        #     logger.info(f"Successfully created label: {label_name} (ID: {label_id})")
+        #     return label_id
             
-        logger.error(f"Failed to create label: {label_name}")
-        return None
+        # logger.error(f"Failed to create label: {label_name}")
+        # return None
+        
+        # NEW: Return a mock label ID for file output
+        mock_label_id = f"mock-label-{label_name.lower().replace(' ', '-')}"
+        logger.info(f"[FILE OUTPUT] Would get/create label: {label_name} (mock ID: {mock_label_id})")
+        return mock_label_id
 
     def add_label_to_issue(self, issue_id: str, label_id: str, issue_identifier: str = None):
         """Adds a label to an issue, preserving existing labels."""
-        if self.config.dry_run:
-            logger.info(f"[DRY RUN] Would add label to issue {issue_identifier or issue_id}")
-            return
+        # COMMENTED OUT: Original Linear API call
+        # if self.config.dry_run:
+        #     logger.info(f"[DRY RUN] Would add label to issue {issue_identifier or issue_id}")
+        #     return
         
-        # Get current labels
-        query = f'''
-        query {{
-            issue(id: "{issue_id}") {{
-                labels {{
-                    nodes {{
-                        id
-                    }}
-                }}
-            }}
-        }}
-        '''
+        # # Get current labels
+        # query = f'''
+        # query {{
+        #     issue(id: "{issue_id}") {{
+        #         labels {{
+        #             nodes {{
+        #                 id
+        #             }}
+        #         }}
+        #     }}
+        # }}
+        # '''
         
-        data = self._make_request(query)
-        if not (data and 'data' in data and 'issue' in data['data']):
-            logger.error(f"Failed to get current labels for issue {issue_id}")
-            return
+        # data = self._make_request(query)
+        # if not (data and 'data' in data and 'issue' in data['data']):
+        #     logger.error(f"Failed to get current labels for issue {issue_id}")
+        #     return
 
-        current_label_ids = [label['id'] for label in data['data']['issue']['labels']['nodes']]
+        # current_label_ids = [label['id'] for label in data['data']['issue']['labels']['nodes']]
         
-        if label_id not in current_label_ids:
-            current_label_ids.append(label_id)
-            mutation = f'''
-            mutation {{
-                issueUpdate(id: "{issue_id}", input: {{
-                    labelIds: {json.dumps(current_label_ids)}
-                }}) {{
-                    success
-                }}
-            }}
-            '''
+        # if label_id not in current_label_ids:
+        #     current_label_ids.append(label_id)
+        #     mutation = f'''
+        #     mutation {{
+        #         issueUpdate(id: "{issue_id}", input: {{
+        #             labelIds: {json.dumps(current_label_ids)}
+        #         }}) {{
+        #             success
+        #         }}
+        #     }}
+        #     '''
             
-            data = self._make_request(mutation)
-            if data and 'data' in data and 'issueUpdate' in data['data'] and data['data']['issueUpdate']['success']:
-                logger.info(f"Successfully added label to issue {issue_identifier or issue_id}")
-            else:
-                logger.error(f"Failed to add label to issue {issue_identifier or issue_id}")
-        else:
-            logger.debug(f"Label already exists on issue {issue_identifier or issue_id}")
+        #     data = self._make_request(mutation)
+        #     if data and 'data' in data and 'issueUpdate' in data['data'] and data['data']['issueUpdate']['success']:
+        #         logger.info(f"Successfully added label to issue {issue_identifier or issue_id}")
+        #     else:
+        #         logger.error(f"Failed to add label to issue {issue_identifier or issue_id}")
+        # else:
+        #     logger.debug(f"Label already exists on issue {issue_identifier or issue_id}")
+        
+        # Log the action (no longer writing to CSV as we use summary approach)
+        logger.info(f"[FILE OUTPUT] Would add label {label_id} to issue {issue_identifier or issue_id}")
 
     def add_comment_to_issue(self, issue_id: str, comment: str, issue_identifier: str = None):
         """Adds a comment to a Linear issue."""
-        if self.config.dry_run:
-            logger.info(f"[DRY RUN] Would add comment to issue {issue_identifier or issue_id}:\n{comment[:100]}...")
-            return
+        # COMMENTED OUT: Original Linear API call
+        # if self.config.dry_run:
+        #     logger.info(f"[DRY RUN] Would add comment to issue {issue_identifier or issue_id}:\n{comment[:100]}...")
+        #     return
         
-        safe_comment = json.dumps(comment)
-        mutation = f'''
-        mutation {{
-            commentCreate(input: {{
-                issueId: "{issue_id}",
-                body: {safe_comment}
-            }}) {{
-                success
-            }}
-        }}
-        '''
+        # safe_comment = json.dumps(comment)
+        # mutation = f'''
+        # mutation {{
+        #     commentCreate(input: {{
+        #         issueId: "{issue_id}",
+        #         body: {safe_comment}
+        #     }}) {{
+        #         success
+        #     }}
+        # }}
+        # '''
         
-        data = self._make_request(mutation)
-        if data and 'data' in data and 'commentCreate' in data['data'] and data['data']['commentCreate']['success']:
-            logger.info(f"Successfully added comment to issue {issue_identifier or issue_id}")
-        else:
-            logger.error(f"Failed to add comment to issue {issue_identifier or issue_id}")
+        # data = self._make_request(mutation)
+        # if data and 'data' in data and 'commentCreate' in data['data'] and data['data']['commentCreate']['success']:
+        #     logger.info(f"Successfully added comment to issue {issue_identifier or issue_id}")
+        # else:
+        #     logger.error(f"Failed to add comment to issue {issue_identifier or issue_id}")
+        
+        # Log the action (no longer writing to CSV as we use summary approach)
+        logger.info(f"[FILE OUTPUT] Would add comment to issue {issue_identifier or issue_id}:\n{comment[:100]}...")
 
     def link_issues(self, source_issue_id: str, related_issue_id: str, 
                    source_identifier: str = None, related_identifier: str = None):
         """Links one issue to another as related, without changing ticket status."""
-        if self.config.dry_run:
-            logger.info(f"[DRY RUN] Would link {source_identifier or source_issue_id} as duplicate of {related_identifier or related_issue_id}")
-            return
+        # COMMENTED OUT: Original Linear API call
+        # if self.config.dry_run:
+        #     logger.info(f"[DRY RUN] Would link {source_identifier or source_issue_id} as duplicate of {related_identifier or related_issue_id}")
+        #     return
         
-        mutation = f'''
-        mutation {{
-            issueRelationCreate(input: {{
-                issueId: "{source_issue_id}",
-                relatedIssueId: "{related_issue_id}",
-                type: related
-            }}) {{
-                success
-            }}
-        }}
-        '''
+        # mutation = f'''
+        # mutation {{
+        #     issueRelationCreate(input: {{
+        #         issueId: "{source_issue_id}",
+        #         relatedIssueId: "{related_issue_id}",
+        #         type: related
+        #     }}) {{
+        #         success
+        #     }}
+        # }}
+        # '''
         
-        data = self._make_request(mutation)
-        if data and 'data' in data and 'issueRelationCreate' in data['data'] and data['data']['issueRelationCreate']['success']:
-            logger.info(f"Successfully linked {source_identifier or source_issue_id} as duplicate of {related_identifier or related_issue_id}")
-        else:
-            logger.error(f"Failed to link issues")
+        # data = self._make_request(mutation)
+        # if data and 'data' in data and 'issueRelationCreate' in data['data'] and data['data']['issueRelationCreate']['success']:
+        #     logger.info(f"Successfully linked {source_identifier or source_issue_id} as duplicate of {related_identifier or related_issue_id}")
+        # else:
+        #     logger.error(f"Failed to link issues")
+        
+        # Log the action (no longer writing to CSV as we use summary approach)
+        logger.info(f"[FILE OUTPUT] Would link {source_identifier or source_issue_id} as duplicate of {related_identifier or related_issue_id}")
 
 
 class ChromaDBManager:
@@ -535,7 +629,7 @@ Analyze each candidate:"""
                 continue
                 
             # Pattern to match: ID: Yes/No, confidence, explanation (single line)
-            pattern = r'^(\d+\.\s*)?([A-Z]+-\d+):\s*(Yes|No),\s*(\d+),\s*(.+)$'
+            pattern = r'^(\d+\.\s*)?([A-Z0-9]+-\d+):\s*(Yes|No),\s*(\d+),\s*(.+)$'
             match = re.match(pattern, line, re.IGNORECASE)
             
             if match:
@@ -607,6 +701,9 @@ def process_ticket(ticket_id: str, config: Config, linear_api: LinearAPI,
         if internal_id and not config.dry_run:
             comment = "🤖 AI Duplicate Detection: No potential duplicates were found for this ticket."
             linear_api.add_comment_to_issue(internal_id, comment, ticket_id)
+        
+        # Write duplicate summary to CSV (no duplicates found)
+        linear_api.write_duplicate_summary(ticket_id, [])
         return {'status': 'completed', 'duplicates_found': 0}
     
     # Analyze with LLM
@@ -618,6 +715,9 @@ def process_ticket(ticket_id: str, config: Config, linear_api: LinearAPI,
     if not internal_id:
         logger.error(f"Could not find internal ID for {ticket_id}")
         return {'status': 'error', 'message': 'Internal ID not found'}
+    
+    # Write duplicate summary to CSV
+    linear_api.write_duplicate_summary(ticket_id, duplicates)
     
     if duplicates:
         # Add label
@@ -702,6 +802,8 @@ Examples:
                        help="Log to file in addition to console")
     parser.add_argument('--confidence-threshold', type=int,
                        help="Override default confidence threshold (0-100)")
+    parser.add_argument('--output-file', type=str,
+                       help="Path to output CSV file for actions (default: linear_actions_output.csv)")
     
     args = parser.parse_args()
     
@@ -715,6 +817,10 @@ Examples:
             dry_run=args.dry_run
         )
         
+        # Override output file if provided
+        if args.output_file:
+            config.output_file = Path(args.output_file)
+        
         # Override confidence threshold if provided
         if args.confidence_threshold is not None:
             if 0 <= args.confidence_threshold <= 100:
@@ -725,6 +831,8 @@ Examples:
         
         if config.dry_run:
             logger.info("🏃 Running in DRY RUN mode - no changes will be made to Linear")
+        
+        logger.info(f"📄 Actions will be written to: {config.output_file}")
         
         # Load issues
         all_issues = load_all_issues(config.issues_json_path)
@@ -759,6 +867,9 @@ Examples:
         analyzer = DuplicateAnalyzer(config)
         all_issues_map = {issue['identifier']: issue for issue in all_issues}
         
+        # Initialize output file
+        linear_api.initialize_output_file()
+        
         # Process tickets
         logger.info(f"Processing {len(tickets_to_process)} tickets...")
         
@@ -790,6 +901,9 @@ Examples:
             except Exception as e:
                 logger.error(f"Unexpected error processing {ticket_id}: {e}", exc_info=True)
                 errors.append((ticket_id, str(e)))
+        
+        # Actions are now written incrementally, but we can still log the summary
+        logger.info(f"All actions have been written incrementally to {config.output_file}")
         
         # Print summary
         logger.info("\n" + "="*50)

@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-def fetch_linear_issues(api_key: str, team_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def fetch_linear_issues(api_key: str) -> List[Dict[str, Any]]:
     """Fetch all issues from Linear using their GraphQL API."""
     
     api_url = "https://api.linear.app/graphql"
@@ -32,11 +32,11 @@ def fetch_linear_issues(api_key: str, team_id: Optional[str] = None) -> List[Dic
     # GraphQL query to fetch issues with pagination
     def build_query(after: Optional[str] = None) -> str:
         after_clause = f', after: "{after}"' if after else ''
-        team_filter = f', filter: {{team: {{id: {{eq: "{team_id}"}}}}}}' if team_id else ''
+        combined_filter = ', filter: {or: [{project: {name: {eq: "Support"}}}, {labels: {name: {eq: "Support"}}}]}'
         
         return f"""
         query {{
-            issues(first: 100{after_clause}{team_filter}) {{
+            issues(first: 100{after_clause}{combined_filter}) {{
                 pageInfo {{
                     hasNextPage
                     endCursor
@@ -154,13 +154,11 @@ def main():
         print("3. Add it to your .env file as: LINEAR_OAUTH_ACCESS_TOKEN=your-token-here")
         return 1
     
-    # Optional: Get team ID if you want to filter by team
-    team_id = os.environ.get('LINEAR_TEAM_ID')
-    if team_id:
-        print(f"Filtering issues by team ID: {team_id}")
+    # Filter for Support project OR Support label
+    print("Filtering issues for 'Support' project OR 'Support' label")
     
-    # Determine output path
-    output_path = Path.home() / "linear_issues.json"
+    # Determine output path - save in current working directory
+    output_path = Path.cwd() / "linear_issues.json"
     
     # Allow custom output path via command line argument
     if len(sys.argv) > 1:
@@ -170,7 +168,7 @@ def main():
     print("-" * 50)
     
     # Fetch issues
-    issues = fetch_linear_issues(api_key, team_id)
+    issues = fetch_linear_issues(api_key)
     
     if issues:
         # Save to file
